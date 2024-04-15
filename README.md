@@ -10,6 +10,10 @@ The basic idea from knative scaling to zero.
 Very similar to Knative but dead simple
 
 ```
+env CONFIGPATH=./config.yaml go run main.go
+```
+
+```
 ExternalIP/ELB -> ondemand-proxy -> ec2 instance
 ```
 
