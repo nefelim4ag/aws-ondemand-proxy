@@ -1,8 +1,8 @@
 package main
 
 import (
-	"context"
 	"flag"
+	"fmt"
 	"net"
 	"os"
 	"os/signal"
@@ -15,19 +15,15 @@ import (
 	"log/slog"
 
 	"gopkg.in/yaml.v3"
-	v1 "k8s.io/api/apps/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/fields"
-	clientset "k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
 
-	"nefelim4ag/k8s-ondemand-proxy/pkg/tcpserver"
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/ec2"
+
+	"nefelim4ag/aws-ondemand-proxy/pkg/tcpserver"
 )
 
 type config struct {
-	Namespace   string        `yaml:"namespace"`
-	Replicas    int           `yaml:"replicas"`
 	Resource    string        `yaml:"resource"`
 	IdleTimeout time.Duration `yaml:"idle-timeout"`
 	Proxy       []proxyPair   `yaml:"proxy"`
@@ -40,36 +36,19 @@ type proxyPair struct {
 
 type globalState struct {
 	lastServe atomic.Int64
-	readyPods atomic.Int32
-	replicas  atomic.Int32
+	stateCode atomic.Int32
 	inOutPort map[int]string
-	namespace string
-	group     string
-	name      string
 
-	client *clientset.Clientset
+	id        string
+	instance *ec2.Instance
+
+	ec2client *ec2.EC2
 
 	servers []tcpserver.Server
 }
 
 func (state *globalState) touch() {
 	state.lastServe.Store(time.Now().Unix())
-}
-
-func buildConfig(kubeconfig string) (*rest.Config, error) {
-	if kubeconfig != "" {
-		cfg, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
-		if err != nil {
-			return nil, err
-		}
-		return cfg, nil
-	}
-
-	cfg, err := rest.InClusterConfig()
-	if err != nil {
-		return nil, err
-	}
-	return cfg, nil
 }
 
 func (state *globalState) pipe(src *net.TCPConn, dst *net.TCPConn) {
@@ -126,9 +105,9 @@ func (state *globalState) connectionHandler(clientConn *net.TCPConn, err error) 
 
 	state.touch()
 	// Must be some sort of locking, or sync.Cond, but I'm too lazy.
-	for state.readyPods.Load() == 0 {
+	for state.stateCode.Load() != 16 { // Running
 		state.touch()
-		time.Sleep(time.Second * 2)
+		time.Sleep(time.Second * 3)
 	}
 
 	var serverConn *net.TCPConn
@@ -137,7 +116,7 @@ func (state *globalState) connectionHandler(clientConn *net.TCPConn, err error) 
 	for t := time.Now(); t.Before(deadline); t = time.Now() {
 		state.touch()
 		// DNS can & will change sometimes, so resolve it each time
-		conn, err := net.DialTimeout("tcp", upstreamRawAddr, time.Second * time.Duration(10))
+		conn, err := net.DialTimeout("tcp", upstreamRawAddr, time.Second*time.Duration(10))
 		if err == nil {
 			serverConn = conn.(*net.TCPConn)
 			break
@@ -146,10 +125,10 @@ func (state *globalState) connectionHandler(clientConn *net.TCPConn, err error) 
 		netErr := err.(*net.OpError)
 		switch netErr.Err.Error() {
 		case "connect: connection refused":
-			slog.Error(err.Error(), "temporary", "maybe", "retry", true, "abortInSec", deadline.Unix() - time.Now().Unix())
+			slog.Error(err.Error(), "temporary", "maybe", "retry", true, "abortInSec", deadline.Unix()-time.Now().Unix())
 			time.Sleep(time.Second * time.Duration(5))
 		case "i/o timeout":
-			slog.Error(err.Error(), "temporary", "maybe", "retry", true, "abortInSec", deadline.Unix() - time.Now().Unix())
+			slog.Error(err.Error(), "temporary", "maybe", "retry", true, "abortInSec", deadline.Unix()-time.Now().Unix())
 		default:
 			slog.Error(err.Error())
 			return
@@ -169,162 +148,97 @@ func (state *globalState) connectionHandler(clientConn *net.TCPConn, err error) 
 	state.pipe(serverConn, clientConn)
 }
 
-func (state *globalState) statusWatcher() {
-	for {
-		// Infinite retry
-		state.watch()
-		time.Sleep(time.Second)
-	}
-}
-
-func (state *globalState) watch() {
-	client := state.client
-	timeout := int64(600)
-
-	listOptions := metav1.ListOptions{
-		FieldSelector:  fields.OneTermEqualSelector(metav1.ObjectNameField, state.name).String(),
-		TimeoutSeconds: &timeout,
-	}
-
-	switch state.group {
-	case "statefulset", "sts":
-		statefulSetClient := client.AppsV1().StatefulSets(state.namespace)
-		sts, err := statefulSetClient.Get(context.TODO(), state.name, metav1.GetOptions{})
-		if err != nil {
-			slog.Error(err.Error())
-			return
-		}
-		state.readyPods.Store(sts.Status.ReadyReplicas)
-		state.replicas.Store(*sts.Spec.Replicas)
-
-		watcher, err := statefulSetClient.Watch(context.TODO(), listOptions)
-		if err != nil {
-			slog.Error(err.Error())
-		}
-		wch := watcher.ResultChan()
-		defer watcher.Stop()
-		for {
-			select {
-			case event, ok := <-wch:
-				if !ok {
-					// Channel closed - restart
-					return
-				}
-				sts, ok := event.Object.(*v1.StatefulSet)
-				if !ok {
-					slog.Error("unexpected type in watch event")
-					return
-				}
-				if *sts.Spec.Replicas != state.replicas.Load() {
-					slog.Info("Scale event - target", "old", state.readyPods.Load(), "new", *sts.Spec.Replicas)
-					state.replicas.Store(*sts.Spec.Replicas)
-				}
-				if sts.Status.ReadyReplicas != state.readyPods.Load() {
-					slog.Info("Scale event - ready", "old", state.readyPods.Load(), "new", sts.Status.ReadyReplicas)
-					state.readyPods.Store(sts.Status.ReadyReplicas)
-				}
-			case <-time.After(11 * time.Minute):
-				// deal with the issue where we get no events
-				return
-			}
-		}
-	case "deployment", "deploy":
-		deploymentClient := client.AppsV1().Deployments(state.namespace)
-		deploy, err := deploymentClient.Get(context.TODO(), state.name, metav1.GetOptions{})
-		if err != nil {
-			slog.Error(err.Error())
-			return
-		}
-		state.readyPods.Store(*deploy.Spec.Replicas)
-		state.replicas.Store(deploy.Status.Replicas)
-
-		watcher, err := deploymentClient.Watch(context.TODO(), listOptions)
-		if err != nil {
-			slog.Error(err.Error())
-		}
-		wch := watcher.ResultChan()
-		defer watcher.Stop()
-		for {
-			select {
-			case event, ok := <-wch:
-				if !ok {
-					// Channel closed - restart
-					return
-				}
-				deploy, ok := event.Object.(*v1.Deployment)
-				if !ok {
-					slog.Error("unexpected type in watch event")
-					return
-				}
-				if *deploy.Spec.Replicas != state.replicas.Load() {
-					slog.Info("Scale event - target", "old", state.readyPods.Load(), "new", *deploy.Spec.Replicas)
-					state.replicas.Store(*deploy.Spec.Replicas)
-				}
-				if deploy.Status.ReadyReplicas != state.readyPods.Load() {
-					slog.Info("Scale event - ready", "old", state.readyPods.Load(), "new", deploy.Status.ReadyReplicas)
-					state.readyPods.Store(deploy.Status.ReadyReplicas)
-				}
-			case <-time.After(11 * time.Minute):
-				// deal with the issue where we get no events
-				return
-			}
-		}
-	default:
-		slog.Error("Api group not supported", "api", state.group)
-	}
-}
-
-func (state *globalState) podsScaler(timeout time.Duration, replicas int32) {
-	for range time.NewTicker(time.Second).C {
+func (state *globalState) Scaler(timeout time.Duration, replicas int32) {
+	for range time.NewTicker(time.Second * 5).C {
 		now := time.Now().Unix()
 		timeoutSec := int64(timeout.Seconds())
 		lastAccess := state.lastServe.Load()
 		if (lastAccess + timeoutSec) < now {
 			state.updateScale(0)
 		} else {
-			state.updateScale(replicas)
+			state.updateScale(1)
 		}
 	}
 }
 
 func (state *globalState) updateScale(replicas int32) {
-	client := state.client
-	if state.replicas.Load() == replicas {
-		// NoOp, wait for pod start
-		return
+	state.describeInstance()
+	toStop := &ec2.StopInstancesInput{
+		InstanceIds: []*string{
+			aws.String(state.id),
+		},
+	}
+	toStart := &ec2.StartInstancesInput{
+		InstanceIds: []*string{
+			aws.String(state.id),
+		},
 	}
 
-	slog.Info("Trigger scale - target", "name", state.name, "replicas", replicas, "group", state.group, "namespace", state.namespace)
-	switch state.group {
-	case "statefulset", "sts":
-		statefulSetClient := client.AppsV1().StatefulSets(state.namespace)
-		scale, err := statefulSetClient.GetScale(context.TODO(), state.name, metav1.GetOptions{})
-		if err != nil {
-			slog.Error(err.Error())
+	switch replicas {
+	case 0:
+		if state.stateCode.Load() == 80 { // Stopped
 			return
 		}
-		scale.Spec.Replicas = replicas
-		scale, err = statefulSetClient.UpdateScale(context.TODO(), state.name, scale, metav1.UpdateOptions{})
-		if err != nil {
-			slog.Error(err.Error())
+		if state.stateCode.Load() == 64 { // Stopping
 			return
 		}
-	case "deployment", "deploy":
-		deploymentClient := client.AppsV1().Deployments(state.namespace)
-		scale, err := deploymentClient.GetScale(context.TODO(), state.name, metav1.GetOptions{})
+        result, err := state.ec2client.StopInstances(toStop)
 		if err != nil {
 			slog.Error(err.Error())
+		}
+		slog.Info("Stopping", slog.String("previous", *result.StoppingInstances[0].PreviousState.Name), slog.String("current", *result.StoppingInstances[0].CurrentState.Name))
+	case 1:
+		if state.stateCode.Load() == 16 { // Running
 			return
 		}
-		scale.Spec.Replicas = replicas
-		scale, err = deploymentClient.UpdateScale(context.TODO(), state.name, scale, metav1.UpdateOptions{})
+        result, err := state.ec2client.StartInstances(toStart)
 		if err != nil {
 			slog.Error(err.Error())
-			return
 		}
-	default:
-		slog.Error("Api group not supported", "api", state.group)
+		slog.Info("Stopping", slog.String("previous", *result.StartingInstances[0].PreviousState.Name), slog.String("current", *result.StartingInstances[0].CurrentState.Name))
 	}
+}
+
+func (state *globalState) describeInstance() {
+	params := &ec2.DescribeInstancesInput{
+		Filters: []*ec2.Filter{
+			{
+				Name:   aws.String("instance-id"),
+				Values: []*string{aws.String(state.id)},
+			},
+		},
+	}
+
+	result, err := state.ec2client.DescribeInstances(params)
+	if err != nil {
+		slog.Error(err.Error())
+		os.Exit(1)
+	}
+
+	if len(result.Reservations) == 0 {
+		slog.Error("Can't find instance", slog.String("ID", state.id))
+		os.Exit(1)
+	}
+	r := result.Reservations[0]
+
+	if len(r.Instances) == 0 {
+		slog.Error("Can't find instance", slog.String("ID", state.id))
+		os.Exit(1)
+	}
+	i := r.Instances[0]
+
+	if len(i.NetworkInterfaces) == 0 {
+		slog.Error("Empty network interfaces on instance", slog.String("ID", state.id))
+		os.Exit(1)
+	}
+
+	if *i.State.Code == 48 {
+		slog.Error("Instance terminated", slog.String("ID", state.id))
+		os.Exit(1)
+	}
+
+	state.instance = i
+	state.stateCode.Store(int32(*i.State.Code))
 }
 
 func main() {
@@ -361,37 +275,34 @@ func main() {
 		os.Exit(1)
 	}
 
-	_Config, err := buildConfig(kubeconfig)
-	if err != nil {
-		slog.Error(err.Error())
-		os.Exit(1)
-	}
-
 	if len(c.Proxy) == 0 {
 		slog.Error("Can't empty proxy section in config")
 		os.Exit(1)
 	}
 
-	client := clientset.NewForConfigOrDie(_Config)
+	// Load session from shared config
+	sess := session.Must(session.NewSessionWithOptions(session.Options{
+		SharedConfigState: session.SharedConfigEnable,
+	}))
 
 	state := globalState{
-		client:    client,
-		namespace: c.Namespace,
+		ec2client: ec2.New(sess),
+		id: c.Resource,
 	}
+
+	state.describeInstance()
+
+	fmt.Println(state.instance)
+	slog.Info("Instance has addresses", slog.String("IPv4", *state.instance.PrivateIpAddress))
+	if len(state.instance.NetworkInterfaces[0].Ipv6Addresses) != 0 {
+		slog.Info("Instance has addresses", slog.String("IPv6", *state.instance.Ipv6Address))
+	}
+	slog.Info("Instance has state", slog.String("Name", *state.instance.State.Name), slog.Int("Code", int(*state.instance.State.Code)))
+
 	state.inOutPort = make(map[int]string, len(c.Proxy))
 
-	resourceArgs := strings.Split(c.Resource, "/")
-	if len(resourceArgs) != 2 {
-		slog.Error("Wrong resource name, must be statefulset/app or deployment/app", "parsed", resourceArgs)
-		return
-	}
-
-	state.group = resourceArgs[0]
-	state.name = resourceArgs[1]
-
 	state.touch()
-	go state.podsScaler(c.IdleTimeout, int32(c.Replicas))
-	go state.statusWatcher()
+	go state.Scaler(c.IdleTimeout, 1)
 
 	state.servers = make([]tcpserver.Server, len(c.Proxy))
 
@@ -404,12 +315,14 @@ func main() {
 
 		localPort := addr.Port
 
-		_, err = net.ResolveTCPAddr("tcp", p.Remote)
+		remote := fmt.Sprintf("%s:%s", *state.instance.PrivateIpAddress, p.Remote)
+
+		_, err = net.ResolveTCPAddr("tcp", remote)
 		if err != nil {
-			slog.Error("failed to resolve address", p.Remote, err.Error())
+			slog.Error("failed to resolve address", remote, err.Error())
 			os.Exit(1)
 		}
-		state.inOutPort[int(localPort)] = p.Remote
+		state.inOutPort[int(localPort)] = remote
 
 		err = state.servers[k].ListenAndServe(addr, state.connectionHandler)
 		if err != nil {

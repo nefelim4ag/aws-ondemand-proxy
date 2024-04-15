@@ -1,7 +1,7 @@
 
-# k8s-ondemand-proxy
+# aws-ondemand-proxy
 
-Simple TCP proxy app that will scale from zero Deployment/StatefulSet  in case of external requests and scale down when no traffic
+Simple TCP proxy app that will start ec2 instance in case of external requests and stop when no traffic
 
 The basic idea from knative scaling to zero.
 
@@ -10,9 +10,7 @@ The basic idea from knative scaling to zero.
 Very similar to Knative but dead simple
 
 ```
-Ingress -> ondemand-proxy -> service -> pod
-# OR
-App -> ondemand-proxy -> service -> pod
+ExternalIP/ELB -> ondemand-proxy -> ec2 instance
 ```
 
 When a connection comes to ondemand-proxy, it holds it up, while in the background starts to scale the target app.

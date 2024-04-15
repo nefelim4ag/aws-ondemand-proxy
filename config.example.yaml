@@ -1,7 +1,5 @@
-namespace: ci
-replicas: 1
-resource: statefulset/dind
+resource: i-0f5ae413504fa518d
 idle-timeout: 15m
 proxy:
 - local: ":2375"
-  remote: dind.ci.svc.cluster.local:2375
+  remote: 2375 # IP will be auto resolved by instance metadata
