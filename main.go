@@ -39,7 +39,7 @@ type globalState struct {
 	stateCode atomic.Int32
 	inOutPort map[int]string
 
-	id        string
+	id       string
 	instance *ec2.Instance
 
 	ec2client *ec2.EC2
@@ -182,7 +182,7 @@ func (state *globalState) updateScale(replicas int32) {
 		if state.stateCode.Load() == 64 { // Stopping
 			return
 		}
-        result, err := state.ec2client.StopInstances(toStop)
+		result, err := state.ec2client.StopInstances(toStop)
 		if err != nil {
 			slog.Error(err.Error())
 		}
@@ -191,7 +191,7 @@ func (state *globalState) updateScale(replicas int32) {
 		if state.stateCode.Load() == 16 { // Running
 			return
 		}
-        result, err := state.ec2client.StartInstances(toStart)
+		result, err := state.ec2client.StartInstances(toStart)
 		if err != nil {
 			slog.Error(err.Error())
 		}
@@ -242,10 +242,8 @@ func (state *globalState) describeInstance() {
 }
 
 func main() {
-	var kubeconfig string
 	var configPath string
 
-	flag.StringVar(&kubeconfig, "kubeconfig", "", "absolute path to the kubeconfig file")
 	flag.StringVar(&configPath, "config", "", "Yaml config path")
 	flag.Parse()
 
@@ -287,7 +285,7 @@ func main() {
 
 	state := globalState{
 		ec2client: ec2.New(sess),
-		id: c.Resource,
+		id:        c.Resource,
 	}
 
 	state.describeInstance()
@@ -314,8 +312,14 @@ func main() {
 		}
 
 		localPort := addr.Port
+		var remote string
 
-		remote := fmt.Sprintf("%s:%s", *state.instance.PrivateIpAddress, p.Remote)
+		if strings.Contains(p.Remote, ":") {
+			slog.Info("'remote' contains ':' assume as address", slog.String("remote", p.Remote))
+			remote = p.Remote
+		} else {
+			remote = fmt.Sprintf("%s:%s", *state.instance.PrivateIpAddress, p.Remote)
+		}
 
 		_, err = net.ResolveTCPAddr("tcp", remote)
 		if err != nil {
