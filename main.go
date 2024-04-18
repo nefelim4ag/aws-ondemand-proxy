@@ -149,6 +149,7 @@ func (state *globalState) connectionHandler(clientConn *net.TCPConn, err error) 
 }
 
 func (state *globalState) Scaler(timeout time.Duration, replicas int32) {
+	var lastInfoMessage int64
 	for range time.NewTicker(time.Second * 5).C {
 		now := time.Now().Unix()
 		timeoutSec := int64(timeout.Seconds())
@@ -157,6 +158,11 @@ func (state *globalState) Scaler(timeout time.Duration, replicas int32) {
 			state.updateScale(0)
 		} else {
 			state.updateScale(1)
+			currInfoMessage := (lastAccess + timeoutSec - now) / 30
+			if lastInfoMessage != currInfoMessage {
+				slog.Info("Instance will be shutdown in seconds", slog.Int64("TTL", (lastAccess + timeoutSec - now)))
+				lastInfoMessage = currInfoMessage
+			}
 		}
 	}
 }
