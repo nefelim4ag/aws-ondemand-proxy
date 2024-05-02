@@ -180,12 +180,23 @@ func (state *globalState) updateScale(replicas int32) {
 		},
 	}
 
+	if state.stateCode.Load() == 0 { // Pending
+		return
+	}
+	if state.stateCode.Load() == 32 { // Shutting-dow
+		return
+	}
+	if state.stateCode.Load() == 48 { // Terminated
+		slog.Error("Instance is terminated", slog.String("id", state.id))
+	}
+
+	if state.stateCode.Load() == 64 { // Stopping
+		return
+	}
+
 	switch replicas {
 	case 0:
 		if state.stateCode.Load() == 80 { // Stopped
-			return
-		}
-		if state.stateCode.Load() == 64 { // Stopping
 			return
 		}
 		result, err := state.ec2client.StopInstances(toStop)
